@@ -8,6 +8,12 @@
 #include <QJsonObject>
 #include <QStandardPaths>
 #include <QDir>
+#include <QDBusInterface>
+#include <QDBusArgument>
+#include <QDBusMessage>
+#include <QDBusReply>
+#include <QDBusMetaType>
+#include <QMetaType>
 #include <algorithm>
 
 K_PLUGIN_CLASS_WITH_JSON(FastAppRunner, "fastapprunner.json")
@@ -88,6 +94,31 @@ void FastAppRunner::match(KRunner::RunnerContext &context)
     QString lowerQuery = query.toLower();
     QList<KRunner::QueryMatch> matches;
 
+    // --- Virtual desktop mode: "x/" prefix ---
+    if (lowerQuery.startsWith(QLatin1String("x/"))) {
+        ensureVirtualDesktopsCached();
+
+        QString searchTerm = lowerQuery.mid(2); // strip "x/"
+
+        for (int i = 0; i < m_vdNames.size(); ++i) {
+            if (searchTerm.isEmpty() || m_vdLowerNames[i].contains(searchTerm)) {
+                KRunner::QueryMatch match(this);
+                match.setText(m_vdNames[i]);
+                match.setIconName(QStringLiteral("desktop"));
+                match.setData(QStringLiteral("vd:") + m_vdIds[i]);
+                match.setId(m_vdIds[i]);
+                // Full list when empty, high relevance when filtering
+                match.setRelevance(searchTerm.isEmpty() ? 0.1 : 0.9);
+                matches << match;
+            }
+        }
+
+        context.addMatches(matches);
+        return; // Do NOT fall through to app search
+    }
+
+    // --- Normal app search mode ---
+
     // Get the launch history for this exact string (e.g. "c" or "ch")
     QHash<QString, int> queryHistory = m_history.value(lowerQuery);
 
@@ -123,8 +154,25 @@ void FastAppRunner::match(KRunner::RunnerContext &context)
 
 void FastAppRunner::run(const KRunner::RunnerContext &context, const KRunner::QueryMatch &action)
 {
+    QString data = action.data().toString();
+
+    // --- Virtual desktop switch ---
+    if (data.startsWith(QStringLiteral("vd:"))) {
+        QString desktopId = data.mid(3);
+
+        QDBusInterface props(QStringLiteral("org.kde.KWin"),
+                             QStringLiteral("/VirtualDesktopManager"),
+                             QStringLiteral("org.freedesktop.DBus.Properties"));
+        props.call(QStringLiteral("Set"),
+                   QStringLiteral("org.kde.KWin.VirtualDesktopManager"),
+                   QStringLiteral("current"),
+                   QVariant(desktopId));
+        return;
+    }
+
+    // --- Normal app launch ---
     QString query = context.query().toLower();
-    QString appId = action.data().toString();
+    QString appId = data;
 
     // 1. Update frequency for this exact typed string
     m_history[query][appId]++;
@@ -136,6 +184,56 @@ void FastAppRunner::run(const KRunner::RunnerContext &context, const KRunner::Qu
         auto *job = new KIO::ApplicationLauncherJob(service);
         job->start();
     }
+}
+
+void FastAppRunner::ensureVirtualDesktopsCached()
+{
+    if (m_vdCached) return;
+
+    // Register the D-Bus meta-type once (thread-safe static)
+    static const bool registered = []() {
+        qDBusRegisterMetaType<DesktopEntry>();
+        return true;
+    }();
+    (void)registered;
+
+    QDBusInterface props(QStringLiteral("org.kde.KWin"),
+                         QStringLiteral("/VirtualDesktopManager"),
+                         QStringLiteral("org.freedesktop.DBus.Properties"));
+
+    QDBusMessage reply = props.call(QStringLiteral("Get"),
+                                     QStringLiteral("org.kde.KWin.VirtualDesktopManager"),
+                                     QStringLiteral("desktops"));
+
+    if (reply.type() != QDBusMessage::ReplyMessage) {
+        m_vdCached = true;
+        return;
+    }
+
+    QVariant outer = reply.arguments().at(0);
+
+    // outer contains QDBusVariant -> extract inner QDBusArgument
+    QMetaType metaType = outer.metaType();
+    void *ptr = metaType.create(outer.constData());
+    QVariant inner = *static_cast<QVariant *>(ptr);
+    metaType.destroy(ptr);
+
+    QDBusArgument arg = inner.value<QDBusArgument>();
+    if (arg.currentSignature() != QLatin1String("a(uss)")) {
+        m_vdCached = true;
+        return;
+    }
+
+    QList<DesktopEntry> desktops;
+    arg >> desktops;
+
+    for (const auto &d : desktops) {
+        m_vdNames << d.name;
+        m_vdLowerNames << d.name.toLower();
+        m_vdIds << d.id;
+    }
+
+    m_vdCached = true;
 }
 
 #include "fastapprunner.moc"

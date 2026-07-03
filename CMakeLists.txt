@@ -11,7 +11,7 @@ find_package(ECM REQUIRED NO_MODULE)
 set(CMAKE_MODULE_PATH ${ECM_MODULE_PATH})
 include(KDEInstallDirs)
 
-find_package(Qt6 COMPONENTS Core Gui REQUIRED)
+find_package(Qt6 COMPONENTS Core Gui DBus REQUIRED)
 find_package(KF6 COMPONENTS Runner Service KIO I18n CoreAddons REQUIRED)
 
 add_library(fastapprunner MODULE fastapprunner.cpp)
@@ -19,6 +19,7 @@ add_library(fastapprunner MODULE fastapprunner.cpp)
 target_link_libraries(fastapprunner
     Qt6::Core
     Qt6::Gui
+    Qt6::DBus
     KF6::Runner
     KF6::Service
     KF6::KIOGui
