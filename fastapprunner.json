@@ -1,0 +1,12 @@
+{
+    "KPlugin": {
+        "Id": "fastapprunner",
+        "Name": "Fast App Search",
+        "Description": "Ultra-fast frequency-based app launcher",
+        "Icon": "applications-system",
+        "Version": "1.0"
+    },
+    "X-Plasma-Runner": {
+        "RunnerTypes": ["Executable"]
+    }
+}
