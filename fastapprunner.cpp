@@ -163,10 +163,13 @@ void FastAppRunner::run(const KRunner::RunnerContext &context, const KRunner::Qu
         QDBusInterface props(QStringLiteral("org.kde.KWin"),
                              QStringLiteral("/VirtualDesktopManager"),
                              QStringLiteral("org.freedesktop.DBus.Properties"));
+
+        QDBusArgument variantValue;
+        variantValue << desktopId;
         props.call(QStringLiteral("Set"),
                    QStringLiteral("org.kde.KWin.VirtualDesktopManager"),
                    QStringLiteral("current"),
-                   QVariant(desktopId));
+                   QVariant::fromValue(variantValue));
         return;
     }
 
