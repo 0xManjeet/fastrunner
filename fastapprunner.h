@@ -40,7 +40,7 @@ private:
     QHash<QString, QHash<QString, int>> m_history;
     QString m_historyFilePath;
 
-    // Virtual desktop cache (lazy-loaded once on first "x/" query)
+    // Virtual desktop cache (lazy-loaded once on first "/" query)
     QStringList m_vdNames;
     QStringList m_vdLowerNames;
     QStringList m_vdIds;

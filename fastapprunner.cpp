@@ -94,11 +94,11 @@ void FastAppRunner::match(KRunner::RunnerContext &context)
     QString lowerQuery = query.toLower();
     QList<KRunner::QueryMatch> matches;
 
-    // --- Virtual desktop mode: "x/" prefix ---
-    if (lowerQuery.startsWith(QLatin1String("x/"))) {
+    // --- Virtual desktop mode: "/" prefix ---
+    if (lowerQuery.startsWith(QLatin1String("/"))) {
         ensureVirtualDesktopsCached();
 
-        QString searchTerm = lowerQuery.mid(2); // strip "x/"
+        QString searchTerm = lowerQuery.mid(1); // strip "/"
 
         for (int i = 0; i < m_vdNames.size(); ++i) {
             if (searchTerm.isEmpty() || m_vdLowerNames[i].contains(searchTerm)) {
