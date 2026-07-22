@@ -14,6 +14,9 @@
 #include <QDBusReply>
 #include <QDBusMetaType>
 #include <QMetaType>
+#include <QDateTime>
+#include <QClipboard>
+#include <QGuiApplication>
 #include <algorithm>
 
 K_PLUGIN_CLASS_WITH_JSON(FastAppRunner, "fastapprunner.json")
@@ -117,6 +120,28 @@ void FastAppRunner::match(KRunner::RunnerContext &context)
         return; // Do NOT fall through to app search
     }
 
+    // --- Date/time: "date" shows current date in dd MMM yy, h:mm AM/PM ---
+    // Match while typing d / da / dat / date
+    if (QStringLiteral("date").startsWith(lowerQuery)) {
+        const QString formatted = QDateTime::currentDateTime()
+            .toString(QStringLiteral("dd MMM yy, h:mm AP"));
+
+        KRunner::QueryMatch match(this);
+        match.setText(formatted);
+        match.setSubtext(QStringLiteral("Copy date to clipboard"));
+        match.setIconName(QStringLiteral("clock"));
+        match.setData(QStringLiteral("date:") + formatted);
+        match.setId(QStringLiteral("current-date"));
+        match.setRelevance(lowerQuery == QLatin1String("date") ? 1.0 : 0.85);
+        matches << match;
+
+        // Exact "date": only show the formatted date, not app matches
+        if (lowerQuery == QLatin1String("date")) {
+            context.addMatches(matches);
+            return;
+        }
+    }
+
     // --- Normal app search mode ---
 
     // Get the launch history for this exact string (e.g. "c" or "ch")
@@ -164,6 +189,15 @@ void FastAppRunner::run(const KRunner::RunnerContext &context, const KRunner::Qu
                               QStringLiteral("/VirtualDesktopManager"),
                               QStringLiteral("org.kde.KWin.VirtualDesktopManager"));
         kwin.setProperty("current", QVariant(desktopId));
+        return;
+    }
+
+    // --- Copy formatted date to clipboard ---
+    if (data.startsWith(QStringLiteral("date:"))) {
+        const QString text = data.mid(5);
+        if (QClipboard *clipboard = QGuiApplication::clipboard()) {
+            clipboard->setText(text);
+        }
         return;
     }
 
