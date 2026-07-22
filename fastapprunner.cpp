@@ -6,6 +6,7 @@
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonArray>
 #include <QStandardPaths>
 #include <QDir>
 #include <QDBusInterface>
@@ -17,9 +18,16 @@
 #include <QDateTime>
 #include <QClipboard>
 #include <QGuiApplication>
+#include <QNetworkRequest>
+#include <QNetworkReply>
+#include <QUrl>
+#include <QProcessEnvironment>
 #include <algorithm>
 
 K_PLUGIN_CLASS_WITH_JSON(FastAppRunner, "fastapprunner.json")
+
+static const QString kAiPrefix = QStringLiteral(">");
+static const QString kAiSuffix = QStringLiteral("/");
 
 FastAppRunner::FastAppRunner(QObject *parent, const KPluginMetaData &metaData)
     : KRunner::AbstractRunner(parent, metaData)
@@ -27,16 +35,175 @@ FastAppRunner::FastAppRunner(QObject *parent, const KPluginMetaData &metaData)
     // Define where to save the launch frequency history
     QString configDir = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
     QDir().mkpath(configDir);
-    m_historyFilePath = configDir + "/fastapprunner_history.json";
+    m_historyFilePath = configDir + QStringLiteral("/fastapprunner_history.json");
+    m_aiConfigFilePath = configDir + QStringLiteral("/fastapprunner_ai.json");
 
     loadHistory();
     loadAppsIntoRAM();
+    loadAiConfig();
 
     // Set priority high so it appears first
     // setPriority(KRunner::AbstractRunner::HighestPriority);
 }
 
-FastAppRunner::~FastAppRunner() = default;
+FastAppRunner::~FastAppRunner()
+{
+    cancelAiRequest();
+}
+
+void FastAppRunner::loadAiConfig()
+{
+    // 1) Environment variable wins (matches curl example)
+    const QString envKey = QProcessEnvironment::systemEnvironment()
+                               .value(QStringLiteral("CEREBRAS_API_KEY"));
+    if (!envKey.isEmpty()) {
+        m_aiApiKey = envKey;
+    }
+
+    // 2) Optional config file overrides URL/model/prompt; fills key if env unset
+    QFile file(m_aiConfigFilePath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return;
+    }
+
+    const QJsonObject root = QJsonDocument::fromJson(file.readAll()).object();
+    if (m_aiApiKey.isEmpty()) {
+        m_aiApiKey = root.value(QStringLiteral("apiKey")).toString();
+    }
+    const QString url = root.value(QStringLiteral("apiUrl")).toString();
+    if (!url.isEmpty()) {
+        m_aiApiUrl = url;
+    }
+    const QString model = root.value(QStringLiteral("model")).toString();
+    if (!model.isEmpty()) {
+        m_aiModel = model;
+    }
+    const QString systemPrompt = root.value(QStringLiteral("systemPrompt")).toString();
+    if (!systemPrompt.isEmpty()) {
+        m_aiSystemPrompt = systemPrompt;
+    }
+}
+
+void FastAppRunner::cancelAiRequest()
+{
+    if (m_aiReply) {
+        m_aiReply->disconnect(this);
+        m_aiReply->abort();
+        m_aiReply->deleteLater();
+        m_aiReply = nullptr;
+    }
+}
+
+void FastAppRunner::requestAiAnswer(KRunner::RunnerContext context, const QString &prompt)
+{
+    if (m_aiApiKey.isEmpty()) {
+        m_aiCacheQuery = context.query();
+        m_aiCacheAnswer = QStringLiteral(
+            "No API key. Set CEREBRAS_API_KEY or put apiKey in:\n") + m_aiConfigFilePath;
+        return;
+    }
+
+    // Already have a fresh answer for this exact query
+    if (m_aiCacheQuery == context.query() && !m_aiCacheAnswer.isEmpty()) {
+        return;
+    }
+
+    // Request already in flight for this query
+    if (m_aiReply && m_aiCacheQuery == context.query()) {
+        return;
+    }
+
+    cancelAiRequest();
+    m_aiCacheQuery = context.query();
+    m_aiCacheAnswer.clear();
+
+    QJsonArray messages;
+    messages.append(QJsonObject{
+        {QStringLiteral("role"), QStringLiteral("system")},
+        {QStringLiteral("content"), m_aiSystemPrompt},
+    });
+    messages.append(QJsonObject{
+        {QStringLiteral("role"), QStringLiteral("user")},
+        {QStringLiteral("content"), prompt},
+    });
+
+    QJsonObject body{
+        {QStringLiteral("model"), m_aiModel},
+        {QStringLiteral("stream"), false},
+        {QStringLiteral("max_tokens"), 1024},
+        {QStringLiteral("temperature"), 1},
+        {QStringLiteral("top_p"), 0.95},
+        {QStringLiteral("messages"), messages},
+    };
+
+    QNetworkRequest req{QUrl(m_aiApiUrl)};
+    req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+    req.setRawHeader("Authorization",
+                     QByteArray("Bearer ") + m_aiApiKey.toUtf8());
+    // Avoid Qt caching any responses
+    req.setAttribute(QNetworkRequest::CacheLoadControlAttribute, QNetworkRequest::AlwaysNetwork);
+
+    m_aiReply = m_nam.post(req, QJsonDocument(body).toJson(QJsonDocument::Compact));
+
+    // Capture context by value so we can check isValid() when the reply finishes.
+    // mutable: addMatch() is non-const on the captured copy.
+    connect(m_aiReply, &QNetworkReply::finished, this, [this, context]() mutable {
+        QNetworkReply *reply = m_aiReply;
+        m_aiReply = nullptr;
+        if (!reply) {
+            return;
+        }
+
+        const QString query = context.query();
+        QString answer;
+
+        if (reply->error() != QNetworkReply::NoError) {
+            answer = QStringLiteral("AI error: ") + reply->errorString();
+            // Surface HTTP body when available (auth/rate-limit messages)
+            const QByteArray errBody = reply->readAll();
+            if (!errBody.isEmpty()) {
+                const QJsonObject errJson = QJsonDocument::fromJson(errBody).object();
+                const QString msg = errJson.value(QStringLiteral("error")).toObject()
+                                        .value(QStringLiteral("message")).toString();
+                if (!msg.isEmpty()) {
+                    answer = QStringLiteral("AI error: ") + msg;
+                }
+            }
+        } else {
+            const QJsonObject root = QJsonDocument::fromJson(reply->readAll()).object();
+            const QJsonArray choices = root.value(QStringLiteral("choices")).toArray();
+            if (!choices.isEmpty()) {
+                answer = choices.at(0).toObject()
+                             .value(QStringLiteral("message")).toObject()
+                             .value(QStringLiteral("content")).toString()
+                             .trimmed();
+            }
+            if (answer.isEmpty()) {
+                answer = QStringLiteral("Empty response from AI");
+            }
+        }
+
+        reply->deleteLater();
+
+        // Only cache / re-add if this is still the active query
+        if (!context.isValid()) {
+            return;
+        }
+
+        m_aiCacheQuery = query;
+        m_aiCacheAnswer = answer;
+
+        KRunner::QueryMatch match(this);
+        match.setText(answer);
+        match.setMultiLine(true);
+        match.setSubtext(QStringLiteral("Copy answer to clipboard"));
+        match.setIconName(QStringLiteral("dialog-messages"));
+        match.setData(QStringLiteral("ai:") + answer);
+        match.setId(QStringLiteral("ai-answer"));
+        match.setRelevance(1.0);
+        context.addMatch(match);
+    });
+}
 
 void FastAppRunner::loadAppsIntoRAM()
 {
@@ -96,6 +263,78 @@ void FastAppRunner::match(KRunner::RunnerContext &context)
 
     QString lowerQuery = query.toLower();
     QList<KRunner::QueryMatch> matches;
+
+    // --- AI mode: >prompt/ ---
+    // Starts with ">". When closed with trailing "/", fire the API request.
+    // Note: checked before virtual-desktop mode ("/...") so ">" never collides.
+    if (query.startsWith(kAiPrefix)) {
+        const bool complete = query.endsWith(kAiSuffix) && query.length() > kAiPrefix.size() + kAiSuffix.size();
+
+        if (!complete) {
+            KRunner::QueryMatch match(this);
+            match.setText(QStringLiteral("AI: type your question, end with /"));
+            match.setSubtext(QStringLiteral("Example: >capital of France/"));
+            match.setIconName(QStringLiteral("dialog-messages"));
+            match.setData(QStringLiteral("ai-hint"));
+            match.setId(QStringLiteral("ai-hint"));
+            match.setRelevance(1.0);
+            matches << match;
+            context.addMatches(matches);
+            return;
+        }
+
+        const QString prompt = query.mid(kAiPrefix.size(),
+                                         query.size() - kAiPrefix.size() - kAiSuffix.size())
+                                   .trimmed();
+        if (prompt.isEmpty()) {
+            KRunner::QueryMatch match(this);
+            match.setText(QStringLiteral("AI: empty question"));
+            match.setIconName(QStringLiteral("dialog-warning"));
+            match.setData(QStringLiteral("ai-hint"));
+            match.setId(QStringLiteral("ai-empty"));
+            match.setRelevance(1.0);
+            matches << match;
+            context.addMatches(matches);
+            return;
+        }
+
+        // Cached answer for this exact query
+        if (m_aiCacheQuery == query && !m_aiCacheAnswer.isEmpty()) {
+            KRunner::QueryMatch match(this);
+            match.setText(m_aiCacheAnswer);
+            match.setMultiLine(true);
+            match.setSubtext(QStringLiteral("Copy answer to clipboard"));
+            match.setIconName(QStringLiteral("dialog-messages"));
+            match.setData(QStringLiteral("ai:") + m_aiCacheAnswer);
+            match.setId(QStringLiteral("ai-answer"));
+            match.setRelevance(1.0);
+            matches << match;
+            context.addMatches(matches);
+            return;
+        }
+
+        // Kick off (or reuse in-flight) request; show loading row immediately
+        requestAiAnswer(context, prompt);
+
+        KRunner::QueryMatch match(this);
+        if (m_aiApiKey.isEmpty() && !m_aiCacheAnswer.isEmpty()) {
+            match.setText(m_aiCacheAnswer);
+            match.setMultiLine(true);
+            match.setSubtext(QStringLiteral("Configure API key"));
+            match.setIconName(QStringLiteral("dialog-warning"));
+            match.setData(QStringLiteral("ai:") + m_aiCacheAnswer);
+        } else {
+            match.setText(QStringLiteral("Asking AI…"));
+            match.setSubtext(prompt);
+            match.setIconName(QStringLiteral("view-refresh"));
+            match.setData(QStringLiteral("ai-loading"));
+        }
+        match.setId(QStringLiteral("ai-pending"));
+        match.setRelevance(1.0);
+        matches << match;
+        context.addMatches(matches);
+        return;
+    }
 
     // --- Virtual desktop mode: "/" prefix ---
     if (lowerQuery.startsWith(QLatin1String("/"))) {
@@ -198,6 +437,18 @@ void FastAppRunner::run(const KRunner::RunnerContext &context, const KRunner::Qu
         if (QClipboard *clipboard = QGuiApplication::clipboard()) {
             clipboard->setText(text);
         }
+        return;
+    }
+
+    // --- Copy AI answer to clipboard ---
+    if (data.startsWith(QStringLiteral("ai:"))) {
+        const QString text = data.mid(3);
+        if (QClipboard *clipboard = QGuiApplication::clipboard()) {
+            clipboard->setText(text);
+        }
+        return;
+    }
+    if (data == QStringLiteral("ai-hint") || data == QStringLiteral("ai-loading")) {
         return;
     }
 
